@@ -1,0 +1,345 @@
+# ppo.py
+# 基于CleanRL PPO实现，适配离散动作空间的安全层
+# 运行命令：python ppo.py --env-id CartPole-v1 --torque_limits 1.0
+
+# 导入必要的库
+import os
+import random
+import time
+import wandb
+from dataclasses import dataclass
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import tyro
+from torch.distributions.categorical import Categorical
+from torch.utils.tensorboard import SummaryWriter
+from safety import SafetyLayer  # 导入安全层
+
+# === 配置参数类 ===
+@dataclass
+class Args:
+    # 实验配置
+    exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    seed: int = 1 #随机种子
+    torch_deterministic: bool = True
+    cuda: bool = True #是否使用GPU
+    track: bool = True
+    wandb_project_name: str = "cleanRL"
+    wandb_entity: str = None
+    capture_video: bool = False
+
+    # 算法参数
+    env_id: str = "CartPole-v1"  # 离散动作环境
+    total_timesteps: int = 500000
+    learning_rate: float = 2.5e-4
+    num_envs: int = 4
+    num_steps: int = 128
+    anneal_lr: bool = True
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    num_minibatches: int = 4
+    update_epochs: int = 4
+    norm_adv: bool = True
+    clip_coef: float = 0.2
+    clip_vloss: bool = True
+    ent_coef: float = 0.01
+    vf_coef: float = 0.5
+    max_grad_norm: float = 0.5
+    target_kl: float = None
+    kl_coeff: float = 0.5
+
+    # 安全层参数（示例值，CartPole无真实扭矩）
+    torque_limits: float = 1.0  # 标量值（离散动作简化处理）
+
+# === 环境创建函数 ===
+def make_env(env_id, idx, capture_video, run_name):
+    """创建并包装Gym环境"""
+    def thunk():
+        if capture_video and idx == 0:
+            env = gym.make(env_id, render_mode="rgb_array")
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        else:
+            env = gym.make(env_id)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        return env
+    return thunk
+
+# === 网络初始化工具函数 ===
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    """正交初始化神经网络层"""
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+# === 智能体网络结构 ===
+class Agent(nn.Module):
+    def __init__(self, envs, torque_limits):
+        super().__init__()
+        # 价值网络
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(np.prod(envs.single_observation_space.shape), 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 1), std=1.0),
+        )
+        # 策略网络
+        self.actor = nn.Sequential(
+            layer_init(nn.Linear(np.prod(envs.single_observation_space.shape), 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
+        )
+        # 安全层（适配离散动作）
+        self.safety_layer = SafetyLayer(torque_limits)
+
+    def get_value(self, x):
+        """获取状态价值"""
+        return self.critic(x)
+
+    def get_action_and_value(self, x, action=None, current_torque=None):
+        """获取动作和对应价值（适配离散动作）"""
+        logits = self.actor(x)
+        probs = Categorical(logits=logits)
+        
+        # 采样动作
+        if action is None:
+            action = probs.sample()
+        
+        # 应用安全层（CartPole示例逻辑）
+        if current_torque is not None:
+            # 离散动作处理（action是形状为[num_envs]的张量）
+            action_np = action.detach().cpu().numpy()
+            # 对每个并行环境应用安全规则
+            safe_actions = [
+                self.safety_layer.apply(a, current_torque) 
+                for a in action_np
+            ]
+            action = torch.tensor(safe_actions, device=x.device, dtype=torch.int64)
+
+        return action, probs.log_prob(action), probs.entropy(), self.critic(x), logits
+
+# === 主程序 ===
+if __name__ == "__main__":
+    args = tyro.cli(Args)
+    # 计算运行时参数
+    args.batch_size = int(args.num_envs * args.num_steps)
+    args.minibatch_size = int(args.batch_size // args.num_minibatches)
+    args.num_iterations = args.total_timesteps // args.batch_size
+    
+    # 初始化日志系统
+    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()]))
+    )
+    if args.track:
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=True,
+            config=vars(args),
+            name=run_name,  # 使用正确的变量名
+            save_code=True,
+        )
+    # 设置随机种子
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = args.torch_deterministic
+
+    # 选择计算设备
+    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+
+    # 创建并行环境
+    envs = gym.vector.SyncVectorEnv(
+        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
+    )
+    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "仅支持离散动作空间"
+
+    # 初始化智能体和优化器
+    agent = Agent(envs, args.torque_limits).to(device)
+    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+
+    # 初始化经验回放缓冲区
+    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
+    actions = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    old_logits = torch.zeros((args.num_steps, args.num_envs, envs.single_action_space.n)).to(device)
+
+    # 开始训练循环
+    global_step = 0
+    start_time = time.time()
+    next_obs, _ = envs.reset(seed=args.seed)
+    next_obs = torch.Tensor(next_obs).to(device)
+    next_done = torch.zeros(args.num_envs).to(device)
+
+    for iteration in range(1, args.num_iterations + 1):
+        # 学习率衰减
+        if args.anneal_lr:
+            frac = 1.0 - (iteration - 1.0) / args.num_iterations
+            lrnow = frac * args.learning_rate
+            optimizer.param_groups[0]["lr"] = lrnow
+
+        # 经验收集阶段
+        for step in range(0, args.num_steps):
+            global_step += args.num_envs
+            obs[step] = next_obs
+            dones[step] = next_done
+
+            # 生成动作（带安全层处理）
+            with torch.no_grad():
+                # 示例获取扭矩（CartPole无扭矩传感器，此处用伪数据）
+                current_torque = 0.5  # 示例值
+                action, logprob, _, value, old_logits_step = agent.get_action_and_value(
+                    next_obs, 
+                    current_torque=current_torque
+                )
+                values[step] = value.flatten()
+                old_logits[step] = old_logits_step.detach()
+
+            actions[step] = action
+            logprobs[step] = logprob
+
+            # 执行动作
+            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            next_done = np.logical_or(terminations, truncations)
+            rewards[step] = torch.tensor(reward).to(device).view(-1)
+            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+
+            # 记录回合信息
+            if "final_info" in infos:
+                for info in infos["final_info"]:
+                    if info and "episode" in info:
+                        print(f"global_step={global_step}, 回合奖励={info['episode']['r']}")
+                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                        if args.track:
+                            wandb.log({
+                                "charts/episodic_return": info["episode"]["r"],
+                                "charts/episodic_length": info["episode"]["l"],
+                                "global_step": global_step
+                            })
+        # 优势值计算
+        with torch.no_grad():
+            next_value = agent.get_value(next_obs).reshape(1, -1)
+            advantages = torch.zeros_like(rewards).to(device)
+            lastgaelam = 0
+            for t in reversed(range(args.num_steps)):
+                if t == args.num_steps - 1:
+                    nextnonterminal = 1.0 - next_done
+                    nextvalues = next_value
+                else:
+                    nextnonterminal = 1.0 - dones[t + 1]
+                    nextvalues = values[t + 1]
+                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+            returns = advantages + values
+
+        # 数据预处理
+        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+        b_logprobs = logprobs.reshape(-1)
+        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_advantages = advantages.reshape(-1)
+        b_returns = returns.reshape(-1)
+        b_values = values.reshape(-1)
+        b_old_logits = old_logits.reshape((-1, envs.single_action_space.n))
+
+        # 策略优化
+        b_inds = np.arange(args.batch_size)
+        clipfracs = []
+        kl_divs = []
+        kl_coeff = args.kl_coeff
+
+        for epoch in range(args.update_epochs):
+            np.random.shuffle(b_inds)
+            for start in range(0, args.batch_size, args.minibatch_size):
+                end = start + args.minibatch_size
+                mb_inds = b_inds[start:end]
+
+                # 计算KL散度
+                with torch.no_grad():
+                    old_dist = Categorical(logits=b_old_logits[mb_inds])
+                new_logits = agent.actor(b_obs[mb_inds])
+                new_dist = Categorical(logits=new_logits)
+                kl_div = torch.distributions.kl.kl_divergence(old_dist, new_dist).mean()
+                kl_divs.append(kl_div.item())
+
+                # 调整KL系数
+                if args.target_kl is not None:
+                    if kl_div > 1.5 * args.target_kl:
+                        kl_coeff *= 2
+                    elif kl_div < 0.5 * args.target_kl:
+                        kl_coeff /= 2
+                    kl_coeff = np.clip(kl_coeff, 0.1, 10)
+
+                # 计算损失函数
+                _, newlogprob, entropy, newvalue , _ = agent.get_action_and_value(
+                    b_obs[mb_inds], b_actions.long()[mb_inds])
+                logratio = newlogprob - b_logprobs[mb_inds]
+                ratio = logratio.exp()
+
+                # 计算策略损失
+                with torch.no_grad():
+                    old_approx_kl = (-logratio).mean()
+                    approx_kl = ((ratio - 1) - logratio).mean()
+                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+
+                mb_advantages = b_advantages[mb_inds]
+                if args.norm_adv:
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+
+                # 策略梯度损失
+                pg_loss1 = -mb_advantages * ratio
+                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                # 价值函数损失
+                newvalue = newvalue.view(-1)
+                if args.clip_vloss:
+                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                    v_clipped = b_values[mb_inds] + torch.clamp(
+                        newvalue - b_values[mb_inds], -args.clip_coef, args.clip_coef)
+                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                    v_loss = 0.5 * v_loss_max.mean()
+                else:
+                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+
+                # 总损失
+                entropy_loss = entropy.mean()
+                loss = pg_loss + kl_coeff * kl_div - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+
+                # 反向传播
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                optimizer.step()
+
+            # 提前终止
+            if args.target_kl is not None and np.mean(kl_divs) > args.target_kl:
+                break
+
+        # 记录指标
+        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
+        writer.add_scalar("losses/kl_divergence", np.mean(kl_divs), global_step)
+        writer.add_scalar("charts/kl_coeff", kl_coeff, global_step)
+        print("SPS:", int(global_step / (time.time() - start_time)))
+        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        #print(f"Current KL Coefficient: {self.kl_coeff:.2f}") 打印动态权重值
+        #if t > 0.8 * limit:
+            #print(f"Joint {i} torque exceeded 80% limit!") 可视化安全约束触发次数
+
+    envs.close()
+    writer.close()
